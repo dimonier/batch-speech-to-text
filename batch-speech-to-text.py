@@ -3,6 +3,8 @@ import os
 import re
 import tempfile
 import subprocess
+import time
+from datetime import timedelta
 
 import whisper
 from transformers import pipeline
@@ -79,6 +81,37 @@ def extract_audio_from_video(video_path: str) -> str:
         print(f"failed: {e}")
         raise
 
+def get_audio_duration(audio_path: str) -> float:
+    """
+    Get the duration of an audio file in seconds using FFmpeg.
+    
+    Args:
+        audio_path: Path to the audio file
+        
+    Returns:
+        Duration in seconds
+    """
+    try:
+        cmd = [
+            'ffmpeg',
+            '-i', audio_path,
+            '-f', 'null',
+            '-'
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Parse FFmpeg output to find duration
+        for line in result.stderr.split('\n'):
+            if 'Duration:' in line:
+                time_str = line.split('Duration:')[1].split(',')[0].strip()
+                h, m, s = time_str.split(':')
+                duration = int(h) * 3600 + int(m) * 60 + float(s)
+                return duration
+        return 0
+    except Exception as e:
+        print(f"Error getting audio duration: {e}")
+        return 0
+
 def main():
     lang_text = f"to {text_language} " if text_language else ""
     print(f"Starting speech-to-text recognition {lang_text}on {device} device")
@@ -144,6 +177,13 @@ def process_audiofile(fname: str, model):
         should_cleanup = False
 
     try:
+        # Get audio duration
+        audio_duration = get_audio_duration(audio_file)
+        print(f"Audio duration: {timedelta(seconds=int(audio_duration))}")
+
+        # Start timing
+        start_time = time.time()
+
         if use_huggingface:
             print("Processing audio with Hugging Face model...")
             result = model(
@@ -165,6 +205,13 @@ def process_audiofile(fname: str, model):
         else:
             result = model.transcribe(audio_file, verbose=False, language=text_language)
             segments = result['segments']
+
+        # Calculate processing time
+        processing_time = time.time() - start_time
+        print(f"Processing time: {timedelta(seconds=int(processing_time))}")
+        if audio_duration > 0:
+            speed = audio_duration / processing_time
+            print(f"Processing speed: {speed:.2f}x real-time")
 
         if args.timecode:
             with open(fname_noext + '_timecode.txt', 'w', encoding='UTF-8') as f:
