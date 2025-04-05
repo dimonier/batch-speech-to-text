@@ -1,28 +1,36 @@
 import argparse
 import os
 import re
+import tempfile
+import subprocess
 
 import whisper
+from transformers import pipeline
 
 # Use script's folder if the folder not specified
 current_folder = os.path.dirname(os.path.abspath(__file__))
 
 # Audio files with specified extensions will be processed
 audio_exts = ['mp3', 'aac', 'wav', 'ogg', 'm4a', 'mp4', 'opus', 'mov']
+video_exts = ['mp4', 'mov', 'avi', 'mkv', 'webm']
 
 parser = argparse.ArgumentParser("Batch speech-to-text converter with punctuation and case restoration")
 parser.add_argument("-i", "--input", type=str, help="input media file to convert to text", default='')
 parser.add_argument("-f", "--folder", type=str, help="folder contaiing files to process", default=current_folder)
 parser.add_argument("-d", "--device", type=str, help="run model on cpu or gpu", choices=['cpu', 'cuda'], default='cpu')
-parser.add_argument("-m", "--model", type=str, help="whisper model for speech-to-text", choices=['tiny', 'base', 'small', 'medium', 'large-v3', 'large-v3-turbo'], default='large-v3-turbo')
+parser.add_argument("-m", "--model", type=str, help="whisper model name or huggingface model path", default='large-v3-turbo')
 parser.add_argument("-l", "--language", type=str, help="force recognition using this language, e.g. ru. Detected automatically if not specified")
 parser.add_argument("-r", "--raw", action="store_true", help="do not fix punctuation and case", default=False)
+parser.add_argument("-t", "--timecode", action="store_true", help="create a file with timecodes", default=False)
 
 args = parser.parse_args()
 audio_folder = args.folder
-whisper_model = args.model
+model_name = args.model
 text_language = args.language
 device = args.device
+
+# Determine if the model is from Hugging Face by checking if the name contains '/'
+use_huggingface = '/' in model_name
 
 if not args.raw:
     from punc import *
@@ -33,17 +41,68 @@ if not args.raw:
     except Exception as e:
         print(f"failed: {e}")
 
+def extract_audio_from_video(video_path: str) -> str:
+    """
+    Extract audio from video file using FFmpeg and save it as a temporary WAV file.
+    
+    Args:
+        video_path: Path to the video file
+        
+    Returns:
+        Path to the temporary audio file
+    """
+    print(f"Extracting audio from video file...", end="")
+    try:
+        # Create a temporary file for the audio
+        temp_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_audio.close()
+        
+        # Use FFmpeg to extract audio
+        cmd = [
+            'ffmpeg',
+            '-i', video_path,
+            '-vn',  # Disable video
+            '-acodec', 'pcm_s16le',  # PCM 16-bit little-endian
+            '-ar', '16000',  # Sample rate 16kHz
+            '-ac', '1',  # Mono audio
+            '-y',  # Overwrite output file
+            temp_audio.name
+        ]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        print("done")
+        return temp_audio.name
+    except subprocess.CalledProcessError as e:
+        print(f"failed: {e.stderr.decode()}")
+        raise
+    except Exception as e:
+        print(f"failed: {e}")
+        raise
+
 def main():
     lang_text = f"to {text_language} " if text_language else ""
     print(f"Starting speech-to-text recognition {lang_text}on {device} device")
-    print(f"Loading whisper model: {whisper_model}", end="... ")
-    try:
-        model = whisper.load_model(whisper_model).to(device)
-#        model = model.to(device)
-        print(f"done")
-    except Exception as e:
-        print(f"failed: {e}")
-        return
+    
+    if use_huggingface:
+        print(f"Loading huggingface model: {model_name}", end="... ")
+        try:
+            model = pipeline(
+                "automatic-speech-recognition",
+                model=model_name,
+                device=device
+            )
+            print(f"done")
+        except Exception as e:
+            print(f"failed: {e}")
+            return
+    else:
+        print(f"Loading whisper model: {model_name}", end="... ")
+        try:
+            model = whisper.load_model(model_name).to(device)
+            print(f"done")
+        except Exception as e:
+            print(f"failed: {e}")
+            return
 
 # Processing a single file
     if args.input:
@@ -65,37 +124,73 @@ def main():
 
 
 def match_ext(filename: str, extensions):
-    return filename.split('.')[-1] in extensions
+    return filename.lower().split('.')[-1] in extensions
 
 
-def process_audiofile(fname: str, model: whisper.model.Whisper):
-
-    fext = fname.split('.')[-1]
+def process_audiofile(fname: str, model):
+    fext = fname.split('.')[-1].lower()
     fname_noext = fname[:-(len(fext)+1)]
+    
+    # If it's a video file, extract audio first
+    if fext in video_exts:
+        try:
+            audio_file = extract_audio_from_video(fname)
+            should_cleanup = True
+        except Exception as e:
+            print(f"Error extracting audio from video: {e}")
+            return
+    else:
+        audio_file = fname
+        should_cleanup = False
 
-    result = model.transcribe(fname, verbose = False, language = text_language)
+    try:
+        if use_huggingface:
+            print("Processing audio with Hugging Face model...")
+            result = model(
+                audio_file,
+                return_timestamps=True,
+            )
+            segments = []
+            for chunk in result["chunks"]:
+                if chunk["timestamp"][0] is not None:  # Проверяем наличие временной метки
+                    segments.append({
+                        "start": chunk["timestamp"][0],
+                        "text": chunk["text"]
+                    })
+                else:
+                    segments.append({
+                        "start": 0,  # Если временная метка отсутствует, используем 0
+                        "text": chunk["text"]
+                    })
+        else:
+            result = model.transcribe(audio_file, verbose=False, language=text_language)
+            segments = result['segments']
 
-    with open(fname_noext + '_timecode.txt', 'w', encoding='UTF-8') as f:
-        for segment in result['segments']:
-            timecode_sec = int(segment['start'])
-            hh = timecode_sec // 3600
-            mm = (timecode_sec % 3600) // 60
-            ss = timecode_sec % 60
-            timecode = f'[{str(hh).zfill(2)}:{str(mm).zfill(2)}:{str(ss).zfill(2)}]'
-            text = segment['text']
-        #                print(f'{timecode} {text}\n')
-            f.write(f'{timecode} {text}\n')
+        if args.timecode:
+            with open(fname_noext + '_timecode.txt', 'w', encoding='UTF-8') as f:
+                for segment in segments:
+                    timecode_sec = int(segment['start'])
+                    hh = timecode_sec // 3600
+                    mm = (timecode_sec % 3600) // 60
+                    ss = timecode_sec % 60
+                    timecode = f'[{str(hh).zfill(2)}:{str(mm).zfill(2)}:{str(ss).zfill(2)}]'
+                    text = segment['text']
+                    f.write(f'{timecode} {text}\n')
 
-    rawtext = ' '.join([segment['text'].strip() for segment in result['segments']])
-    rawtext = re.sub(" +", " ", rawtext)
+        rawtext = ' '.join([segment['text'].strip() for segment in segments])
+        rawtext = re.sub(" +", " ", rawtext)
 
-    alltext = re.sub("([\.\!\?]) ", "\\1\n", rawtext)
+        alltext = re.sub("([\.\!\?]) ", "\\1\n", rawtext)
 
-    if not args.raw:
-        alltext = fix_punctuation(alltext)
+        if not args.raw:
+            alltext = fix_punctuation(alltext)
 
-    with open(fname_noext + '.txt', 'w', encoding='UTF-8') as f:
-        f.write(alltext)
+        with open(fname_noext + '.txt', 'w', encoding='UTF-8') as f:
+            f.write(alltext)
+    finally:
+        # Clean up temporary audio file if it was created
+        if should_cleanup and os.path.exists(audio_file):
+            os.unlink(audio_file)
 
 def fix_punctuation(text: str) -> str:
     text = text.splitlines()
